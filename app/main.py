@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from typing import Optional
 
@@ -12,6 +13,7 @@ from .card import build_agent_card
 from .schemas import Proposal, ResultsData
 
 app = FastAPI()
+logger = logging.getLogger("a2a")
 
 
 # ---------------- protocol-level checks (all routes except the card) ----------------
@@ -63,42 +65,60 @@ def agent_card():
 
 @app.post("/a2a/message:send")
 def message_send(request: Request, body: dict, authorization: Optional[str] = Header(default=None)):
-    check_protocol_headers(request)
-    principal = require_principal(authorization)
+    start = time.monotonic()
+    try:
+        check_protocol_headers(request)
+        principal = require_principal(authorization)
 
-    message = body.get("message")
-    configuration = body.get("configuration") or {}
-    if not message or "messageId" not in message or "parts" not in message:
-        return a2a_response(error_body("BAD_REQUEST", "malformed message"), 400)
+        message = body.get("message")
+        configuration = body.get("configuration") or {}
+        if not message or "messageId" not in message or "parts" not in message:
+            return a2a_response(error_body("BAD_REQUEST", "malformed message"), 400)
 
-    message_id = message["messageId"]
-    content_hash = message_content_hash(message)
-    history_limit = configuration.get("historyLength")
+        message_id = message["messageId"]
+        content_hash = message_content_hash(message)
+        history_limit = configuration.get("historyLength")
 
-    with storage.txn() as conn:
-        existing = storage.get_idempotency(conn, principal, message_id)
-        if existing:
-            if existing["content_hash"] == content_hash:
-                return a2a_response(json.loads(existing["response_json"]), 200)
-            return a2a_response(
-                error_body("IDEMPOTENCY_CONFLICT", "messageId reused with different content"), 409
-            )
+        with storage.txn() as conn:
+            existing = storage.get_idempotency(conn, principal, message_id)
+            if existing:
+                if existing["content_hash"] == content_hash:
+                    return a2a_response(json.loads(existing["response_json"]), 200)
+                return a2a_response(
+                    error_body("IDEMPOTENCY_CONFLICT", "messageId reused with different content"), 409
+                )
 
-        parts = message.get("parts") or []
-        if not parts:
-            return a2a_response(error_body("BAD_REQUEST", "message has no parts"), 400)
-        media_type = parts[0].get("mediaType")
+            parts = message.get("parts") or []
+            if not parts:
+                return a2a_response(error_body("BAD_REQUEST", "message has no parts"), 400)
+            media_type = parts[0].get("mediaType")
 
-        if media_type == config.MEDIA_BATCH:
-            resp, status, task_id = _handle_initial_batch(conn, principal, message, parts[0]["data"], history_limit)
-        elif media_type == config.MEDIA_RESULTS:
-            resp, status, task_id = _handle_results(conn, principal, message, parts[0]["data"], history_limit)
-        else:
-            return a2a_response(error_body("BAD_REQUEST", "unsupported part mediaType"), 400)
+            if media_type == config.MEDIA_BATCH:
+                resp, status, task_id = _handle_initial_batch(
+                    conn, principal, message, parts[0].get("data") or {}, history_limit
+                )
+            elif media_type == config.MEDIA_RESULTS:
+                resp, status, task_id = _handle_results(
+                    conn, principal, message, parts[0].get("data") or {}, history_limit
+                )
+            else:
+                return a2a_response(error_body("BAD_REQUEST", "unsupported part mediaType"), 400)
 
-        if status == 200:
-            storage.put_idempotency(conn, principal, message_id, content_hash, task_id, resp)
-        return a2a_response(resp, status)
+            if status == 200:
+                storage.put_idempotency(conn, principal, message_id, content_hash, task_id, resp)
+            return a2a_response(resp, status)
+
+    except HTTPException:
+        raise  # let FastAPI's normal 4xx handling take these (auth/header checks)
+    except Exception as e:  # noqa: BLE001
+        # Last-resort catch: never let an unhandled exception propagate out of
+        # the route. An unhandled exception can crash/restart the worker,
+        # which a front-end proxy reports to the caller as a 502 rather than
+        # a clean JSON 500 -- swallow it here and return a real, parseable
+        # A2A error response instead.
+        elapsed = time.monotonic() - start
+        logger.exception("message:send failed after %.2fs", elapsed)
+        return a2a_response(error_body("INTERNAL_ERROR", f"{type(e).__name__}: {e}"), 500)
 
 
 def _handle_initial_batch(conn, principal, message, data, history_limit):
@@ -127,6 +147,7 @@ def _handle_initial_batch(conn, principal, message, data, history_limit):
         try:
             fresh = ai_client.decide_packages(to_decide)
         except Exception as e:  # noqa: BLE001
+            logger.warning("AI decision step failed: %s", e)
             return error_body("AI_DECISION_FAILED", str(e)), 502, ""
         for pkg in to_decide:
             pid = pkg["packageId"]
@@ -157,6 +178,7 @@ def _handle_initial_batch(conn, principal, message, data, history_limit):
         try:
             validated = Proposal(**candidate)
         except ValidationError as e:
+            logger.warning("Proposal validation failed for %s: %s", pid, e)
             return error_body("INVALID_PROPOSAL", f"{pid}: {e}"), 502, ""
         proposals.append(json.loads(validated.model_dump_json()))
 
