@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import httpx
 
 from . import config
@@ -34,6 +35,13 @@ Return STRICT JSON ONLY (no markdown fences, no prose) as an array. Each item:
 Return one item per package, in the same order as given. Output nothing else.
 """
 
+# Total wall-clock budget for the whole decide_packages() call, including any
+# retry. Keeping this comfortably under common reverse-proxy / gateway
+# timeouts (often 30-60s) prevents the platform's edge from returning a 502
+# before your app ever gets to send a response.
+TOTAL_BUDGET_SECONDS = 25.0
+PER_REQUEST_TIMEOUT = 12.0
+
 
 def _extract_json_array(text: str):
     text = text.strip()
@@ -42,13 +50,31 @@ def _extract_json_array(text: str):
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1:
-        raise ValueError("no JSON array found in model output")
+        raise ValueError(f"no JSON array found in model output: {text[:300]!r}")
     return json.loads(text[start:end + 1])
+
+
+def _coerce_item(item: dict) -> dict:
+    """Normalize common near-miss shapes from the model so a minor slip
+    (e.g. amountMinor as a string) doesn't blow up schema validation."""
+    facts = item.get("facts") or {}
+    if isinstance(facts.get("amountMinor"), str):
+        digits = re.sub(r"[^\d-]", "", facts["amountMinor"])
+        if digits:
+            facts["amountMinor"] = int(digits)
+    if not isinstance(item.get("evidenceRefs"), list):
+        item["evidenceRefs"] = [item["evidenceRefs"]] if item.get("evidenceRefs") else []
+    item["facts"] = facts
+    return item
 
 
 def decide_packages(packages: list[dict]) -> dict:
     """Batch every package needing a fresh decision into ONE model call.
-    Returns {packageId: decision_dict}."""
+    Returns {packageId: decision_dict}.
+
+    Bounded to TOTAL_BUDGET_SECONDS wall-clock time across all attempts so a
+    slow/unresponsive upstream can never stack into a proxy-level timeout.
+    """
     if not packages:
         return {}
     if not config.AIPIPE_TOKEN:
@@ -69,28 +95,43 @@ def decide_packages(packages: list[dict]) -> dict:
     }
     url = f"{config.AIPIPE_BASE_URL.rstrip('/')}/chat/completions"
 
+    deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
     last_err = None
-    for attempt in range(2):  # one retry with a repair nudge
+
+    for attempt in range(2):  # one retry with a repair nudge, budget permitting
+        remaining = deadline - time.monotonic()
+        if remaining <= 1.0:
+            break
+        timeout = min(PER_REQUEST_TIMEOUT, remaining)
+
         if attempt == 1:
             body["messages"].append({
                 "role": "user",
                 "content": "Your previous output was not valid strict JSON matching the "
                             "required array schema. Return ONLY the corrected JSON array now.",
             })
-        with httpx.Client(timeout=40.0) as client:
-            resp = client.post(url, headers=headers, json=body)
-            if resp.is_error:
-                # Surface AI Pipe's actual response body instead of swallowing it.
-                # This is what previously threw away the "pricing unknown" /
-                # "insufficient credits" details behind a generic HTTPStatusError.
-                raise RuntimeError(
-                    f"AI Pipe request failed ({resp.status_code}) "
-                    f"for model={body['model']!r} url={url!r}: {resp.text}"
-                )
-            data = resp.json()
-        content = data["choices"][0]["message"]["content"]
         try:
-            items = _extract_json_array(content)
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(url, headers=headers, json=body)
+        except httpx.TimeoutException as e:
+            last_err = RuntimeError(f"AI Pipe request timed out after {timeout:.1f}s: {e}")
+            continue
+        except httpx.HTTPError as e:
+            last_err = RuntimeError(f"AI Pipe request failed to connect: {e}")
+            continue
+
+        if resp.is_error:
+            # Surface AI Pipe's actual response body instead of swallowing it.
+            last_err = RuntimeError(
+                f"AI Pipe request failed ({resp.status_code}) "
+                f"for model={body['model']!r} url={url!r}: {resp.text[:500]}"
+            )
+            continue
+
+        try:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            items = [_coerce_item(i) for i in _extract_json_array(content)]
             by_id = {}
             for item in items:
                 pid = item["packageId"]
@@ -102,4 +143,5 @@ def decide_packages(packages: list[dict]) -> dict:
         except Exception as e:  # noqa: BLE001
             last_err = e
             continue
-    raise RuntimeError(f"AI decision step failed after retry: {last_err}")
+
+    raise RuntimeError(f"AI decision step failed after retry (budget={TOTAL_BUDGET_SECONDS}s): {last_err}")
