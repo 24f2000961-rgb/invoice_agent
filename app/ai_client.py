@@ -87,8 +87,12 @@ def decide_packages(packages: list[dict]) -> dict:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_payload},
         ],
-        "temperature": 0,
     }
+    # gpt-5-nano (and some other newer models) reject an explicit
+    # "temperature" value other than the default (1) -- omit the param
+    # entirely for those models instead of sending an unsupported 0.
+    if not config.AIPIPE_MODEL.startswith("gpt-5"):
+        body["temperature"] = 0
     headers = {
         "Authorization": f"Bearer {config.AIPIPE_TOKEN}",
         "Content-Type": "application/json",
