@@ -79,7 +79,14 @@ def decide_packages(packages: list[dict]) -> dict:
             })
         with httpx.Client(timeout=40.0) as client:
             resp = client.post(url, headers=headers, json=body)
-            resp.raise_for_status()
+            if resp.is_error:
+                # Surface AI Pipe's actual response body instead of swallowing it.
+                # This is what previously threw away the "pricing unknown" /
+                # "insufficient credits" details behind a generic HTTPStatusError.
+                raise RuntimeError(
+                    f"AI Pipe request failed ({resp.status_code}) "
+                    f"for model={body['model']!r} url={url!r}: {resp.text}"
+                )
             data = resp.json()
         content = data["choices"][0]["message"]["content"]
         try:
